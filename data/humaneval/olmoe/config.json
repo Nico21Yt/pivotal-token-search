@@ -1,0 +1,19 @@
+{
+  "dataset": "humaneval",
+  "language": "python",
+  "model_id": "allenai/OLMoE-1B-7B-0125-Instruct",
+  "revision": "b89a7c4bc24fb9e55ce2543c9458ce0ca5c4650e",
+  "dtype": "bfloat16",
+  "chat": true,
+  "system_prompt": null,
+  "num_draws": 20,
+  "temperature": 0.8,
+  "top_p": 0.95,
+  "max_new_tokens": 768,
+  "seed": 1234,
+  "batch_size": 64,
+  "timeout": 10.0,
+  "transformers": "4.48.3",
+  "torch": "2.6.0+cu124",
+  "pass_at_1": 0.3524
+}

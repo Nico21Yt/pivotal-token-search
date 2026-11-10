@@ -6,6 +6,9 @@ each with the official HumanEval tests.  Generation stops at a stop token or as 
 outcome (exactly equivalent, just shorter).
 
 Everything is configured with environment variables (defaults in brackets):
+    PTS_DATA        a capture run dir (data/<dataset>/[<lang>/]<model>, with samples.parquet + config.json):
+                    task, model, revision, system prompt and sampler then default to that run's settings
+    PTS_TASK        humaneval | humanevalx-python | humanevalx-cpp | humanevalx-java | humanevalx-js  [humaneval]
     PTS_MODEL       HF model id or local path              [allenai/OLMoE-1B-7B-0125-Instruct]
     PTS_REVISION    HF revision                             [pinned commit for the default model, else latest]
     PTS_DTYPE       bfloat16 | float16 | float32            [bfloat16]
@@ -22,6 +25,7 @@ Everything is configured with environment variables (defaults in brackets):
     PTS_SEL_LO, PTS_SEL_HI  keep problems with SEL_LO <= p(success) <= SEL_HI   [0.2, 0.8]
     PTS_LIMIT       use only the first N problems (smoke tests)                  [all 164]
     PTS_B           rollouts per generation batch           [128]
+    PTS_GRADE_WORKERS  parallel test processes             [8]
     PTS_TLIM        stop a job after this many seconds (resume later); 0 = none  [0]
 """
 import hashlib
@@ -32,18 +36,27 @@ import zlib
 from concurrent.futures import ThreadPoolExecutor
 
 import humaneval as he
+import humanevalx as hx
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 _E = os.environ.get
+DATA = _E("PTS_DATA")
+CFG = json.load(open(os.path.join(DATA, "config.json"))) if DATA else {}
+TASK = _E("PTS_TASK") or ((CFG["dataset"] if CFG["dataset"] == "humaneval" else f"humanevalx-{CFG['language']}")
+                          if CFG else "humaneval")
+LANG = "python" if TASK == "humaneval" else TASK.split("-", 1)[1]
+assert TASK == "humaneval" or (TASK.startswith("humanevalx-") and LANG in hx.LANGUAGES), f"unknown PTS_TASK {TASK}"
 DEFAULT_MODEL = ("allenai/OLMoE-1B-7B-0125-Instruct", "b89a7c4bc24fb9e55ce2543c9458ce0ca5c4650e")
-MODEL = _E("PTS_MODEL", DEFAULT_MODEL[0])
-REVISION = _E("PTS_REVISION") or (DEFAULT_MODEL[1] if MODEL == DEFAULT_MODEL[0] else None)
-DTYPE = _E("PTS_DTYPE", "bfloat16")
+MODEL = _E("PTS_MODEL") or CFG.get("model_id") or DEFAULT_MODEL[0]
+REVISION = _E("PTS_REVISION") or (CFG.get("revision") if CFG.get("model_id") == MODEL else None) or \
+    (DEFAULT_MODEL[1] if MODEL == DEFAULT_MODEL[0] else None)
+DTYPE = _E("PTS_DTYPE") or CFG.get("dtype") or "bfloat16"
 TRUST = _E("PTS_TRUST_REMOTE_CODE") == "1"
-SYSTEM = _E("PTS_SYSTEM") or None
-WORK = _E("PTS_WORK", os.path.join("work", MODEL.rstrip("/").split("/")[-1]))
-BUDGET = int(_E("PTS_BUDGET", "768"))
-TEMP, TOP_P = float(_E("PTS_TEMP", "0.8")), float(_E("PTS_TOP_P", "0.95"))
+SYSTEM = _E("PTS_SYSTEM") or CFG.get("system_prompt") or None
+WORK = _E("PTS_WORK") or os.path.join("work", f"{TASK}-{MODEL.rstrip('/').split('/')[-1]}")
+BUDGET = int(_E("PTS_BUDGET") or CFG.get("max_new_tokens") or 768)
+TEMP = float(_E("PTS_TEMP") or CFG.get("temperature") or 0.8)
+TOP_P = float(_E("PTS_TOP_P") or CFG.get("top_p") or 0.95)
 N_SCREEN = int(_E("PTS_N_SCREEN", "20"))
 N_SEARCH = int(_E("PTS_N_SEARCH", "32"))
 N_CONFIRM = int(_E("PTS_N_CONFIRM", "64"))
@@ -52,7 +65,9 @@ SEL_LO, SEL_HI = float(_E("PTS_SEL_LO", "0.2")), float(_E("PTS_SEL_HI", "0.8"))
 LIMIT = int(_E("PTS_LIMIT", "0"))
 B = int(_E("PTS_B", "128"))
 TLIM = float(_E("PTS_TLIM", "0")) or float("inf")
-CLOSED = re.compile(r"```(?:python|py)?[ \t]*\n(.*?)```", re.S)
+GRADE_WORKERS = int(_E("PTS_GRADE_WORKERS", "8"))
+# the reply's first fenced block is closed (humaneval's extractor takes python/py tags only)
+CLOSED = re.compile(r"```(?:python|py)?[ \t]*\n(.*?)```", re.S) if TASK == "humaneval" else hx.closed_block(LANG)
 os.makedirs(WORK, exist_ok=True)
 
 
@@ -91,13 +106,19 @@ def stops(tok, m=None):
 
 # ------------------------------------------------------------------ problems / prompts
 
+def problems():
+    return he.problems() if TASK == "humaneval" else hx.problems(LANG)
+
+
 def items():
-    P = list(he.problems())
+    P = list(problems())
     return P[:LIMIT] if LIMIT else P
 
 
 def prompt_ids(tok, item):
-    return he.prompt_ids(tok, he.problems()[item], SYSTEM)
+    if TASK == "humaneval":
+        return he.prompt_ids(tok, he.problems()[item], SYSTEM)
+    return hx.prompt_ids(tok, hx.problems(LANG)[item], SYSTEM)
 
 
 # ------------------------------------------------------------------ grading (memoised by program text)
@@ -107,11 +128,16 @@ _gcache = {}
 
 def grade_many(items, texts, workers=16):
     """([passed], [code hash]) for (item, response text); identical extracted programs are run once."""
-    H = he.problems()
-    keys = [(i, he.extract_code(t)) for i, t in zip(items, texts)]
+    H = problems()
+    if TASK == "humaneval":
+        ext, build, run = he.extract_code, he.build_program, (lambda progs: he.evaluate(progs, 10.0, workers))
+    else:
+        ext, build, run = (lambda t: hx.extract_code(t, LANG)), hx.build_program, \
+            (lambda progs: hx.evaluate(LANG, progs, 10.0, workers))
+    keys = [(i, ext(t)) for i, t in zip(items, texts)]
     todo = sorted({k for k in keys if k not in _gcache})
     if todo:
-        for k, ok in zip(todo, he.evaluate([he.build_program(H[i], c) for i, c in todo], 10.0, workers)):
+        for k, ok in zip(todo, run([build(H[i], c) for i, c in todo])):
             _gcache[k] = bool(ok)
     return [_gcache[k] for k in keys], [hashlib.md5(k[1].encode()).hexdigest()[:10] for k in keys]
 
@@ -119,7 +145,8 @@ def grade_many(items, texts, workers=16):
 class Grader:
     """Grade batches in a background thread while the GPU generates the next one."""
 
-    def __init__(self, workers=8):
+    def __init__(self, workers=None):
+        workers = workers or GRADE_WORKERS
         self.pool = ThreadPoolExecutor(1)
         self.workers = workers
         self.pending = []
